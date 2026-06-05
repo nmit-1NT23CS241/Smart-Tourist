@@ -88,7 +88,7 @@ fun ModelInfoBanner(interactions: Int, learningMode: String, explorationRate: Do
 
 @Composable
 fun RecommendationCard(recommendation: Recommendation, onLike: () -> Unit, onDislike: () -> Unit) {
-    val typeEmoji = mapOf("nature" to "🌿", "heritage" to "🏛️", "beach" to "🏖️", "culture" to "🎭")
+    val typeEmoji = mapOf("nature" to "🌿", "heritage" to "🏛️", "beach" to "🏖️", "culture" to "🎭", "adventure" to "🧗")
     val crowdColor = when (recommendation.crowd_level) { "Low" -> Color(0xFF2E7D32); "Medium" -> Color(0xFFF57F17); else -> Color(0xFFC62828) }
     var feedbackGiven by remember { mutableStateOf<Boolean?>(null) }
     var expanded by remember { mutableStateOf(false) }
