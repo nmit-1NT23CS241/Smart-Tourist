@@ -27,8 +27,8 @@ fun PreferencesScreen(
     val travelType by viewModel.travelType.collectAsState()
     val sustainabilityPref by viewModel.sustainabilityPref.collectAsState()
 
-    val travelTypes = listOf("nature", "heritage", "beach", "culture")
-    val travelEmojis = mapOf("nature" to "🌿", "heritage" to "🏛️", "beach" to "🏖️", "culture" to "🎭")
+    val travelTypes = listOf("nature", "heritage", "beach", "culture", "adventure")
+    val travelEmojis = mapOf("nature" to "🌿", "heritage" to "🏛️", "beach" to "🏖️", "culture" to "🎭", "adventure" to "🧗")
 
     Column(
         modifier = Modifier
