@@ -76,4 +76,20 @@ class TourismViewModel : ViewModel() {
             } catch (_: Exception) {}
         }
     }
+}    fun sendFeedback(destinationId: Int, liked: Boolean) {
+        viewModelScope.launch {
+            try {
+                val fb = FeedbackRequest(
+                    user_id = "user_001",
+                    destination_id = destinationId,
+                    liked = liked,
+                    budget_min = budgetMin.value,
+                    budget_max = budgetMax.value,
+                    travel_type = travelType.value,
+                    sustainability_pref = sustainabilityPref.value
+                )
+                RetrofitClient.api.sendFeedback(fb)
+            } catch (_: Exception) {}
+        }
+    }
 }
