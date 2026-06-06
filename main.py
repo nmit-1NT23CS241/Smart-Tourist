@@ -1,12 +1,24 @@
 import json
 import os
 import random
+import time
 from collections import deque
+from typing import Optional
 
+import httpx
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# ─── Weather config ───────────────────────────────────────────────────────────
+try:
+    from config import OPENWEATHER_API_KEY as WEATHER_API_KEY
+except ImportError:
+    WEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
+WEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
+WEATHER_CACHE_TTL = 3600  # cache weather for 1 hour per destination
+_weather_cache: dict = {}  # {dest_id: {"data": {...}, "ts": timestamp}}
 
 app = FastAPI(title="SafarAI RL API")
 
@@ -60,6 +72,11 @@ def _budget_midpoint(dest: dict) -> int:
     daily = (mid[0] + mid[1]) / 2
     ideal_days = max(dest.get("ideal_days", 3), 1)
     return int(daily * ideal_days)
+
+
+def _budget_range_full(dest: dict) -> tuple[int, int]:
+    """Return full budget range stored in destination dict."""
+    return dest["full_budget_min"], dest["full_budget_max"]
 
 
 def _crowd_score(dest: dict) -> float:
@@ -118,6 +135,8 @@ def load_destinations(path: str) -> list[dict]:
             "food_scene":      d.get("food_scene", ""),
             "local_cuisine":   d.get("local_cuisine_must_try", []),
             "accommodation_types": d.get("accommodation_types", []),
+            "full_budget_min":  int(d["budget_category"]["total_daily_range"][0] * max(d.get("ideal_days", 3), 1)),
+            "full_budget_max":  int(d["luxury_category"]["total_daily_range"][1] * max(d.get("ideal_days", 3), 1)),
         })
     return destinations
 
@@ -241,16 +260,44 @@ def get_state(prefs: dict) -> list:
     ]
 
 
+def _best_cost_estimate(dest: dict, budget_min: int, budget_max: int) -> int:
+    """Return the cost that best fits within the user budget range."""
+    budget_mid = (budget_min + budget_max) / 2
+    full_min = dest["full_budget_min"]
+    full_max = dest["full_budget_max"]
+    mid_cost = dest["budget"]
+
+    # If budget_mid fits within the destination range, show closest tier
+    if budget_mid <= full_min:
+        return full_min  # show cheapest option
+    elif budget_mid >= full_max:
+        return full_max  # show luxury
+    elif budget_mid <= mid_cost:
+        return int((full_min + mid_cost) / 2)  # budget tier estimate
+    else:
+        return int((mid_cost + full_max) / 2)  # mid-luxury estimate
+
+
 def score_destination(dest: dict, prefs: dict) -> float:
     budget_min = prefs["budget_min"]
     budget_max = prefs["budget_max"]
-    dest_cost  = dest["budget"]
 
-    if budget_min <= dest_cost <= budget_max:
-        budget_fit = 1.0
+    # Use full range (budget tier to luxury tier) for matching
+    dest_min, dest_max = _budget_range_full(dest)
+
+    # Check overlap between user budget and destination full range
+    overlap = max(0, min(budget_max, dest_max) - max(budget_min, dest_min))
+    user_range = max(budget_max - budget_min, 1)
+    dest_range = max(dest_max - dest_min, 1)
+
+    if overlap > 0:
+        budget_fit = min(1.0, overlap / min(user_range, dest_range))
     else:
-        distance   = max(dest_cost - budget_max, budget_min - dest_cost, 0)
+        # No overlap — penalise by distance
+        distance = max(dest_min - budget_max, budget_min - dest_max, 0)
         budget_fit = max(0.0, 1.0 - distance / max(budget_max, 1))
+        if budget_fit < 0.2:
+            budget_fit = 0.0
 
     travel_type = prefs["travel_type"]
     if dest["tags"] and dest["tags"][0] == travel_type:
@@ -275,6 +322,72 @@ def update_q_table(state_idx: int, action: int, reward: float, next_state_idx: i
 
 def save_q_table():
     np.save(Q_TABLE_PATH, q_table)
+
+
+async def fetch_weather(dest: dict) -> Optional[dict]:
+    dest_id = dest["id"]
+    coords  = dest.get("coordinates", {})
+    lat     = coords.get("latitude")
+    lon     = coords.get("longitude")
+    if not lat or not lon:
+        return None
+    cached = _weather_cache.get(dest_id)
+    if cached and (time.time() - cached["ts"]) < WEATHER_CACHE_TTL:
+        return cached["data"]
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(WEATHER_BASE_URL, params={
+                "lat": lat, "lon": lon,
+                "appid": WEATHER_API_KEY, "units": "metric",
+            })
+            if resp.status_code != 200:
+                return None
+            raw  = resp.json()
+            data = {
+                "temp_c":            round(raw["main"]["temp"], 1),
+                "feels_like":        round(raw["main"]["feels_like"], 1),
+                "humidity":          raw["main"]["humidity"],
+                "description":       raw["weather"][0]["description"].title(),
+                "icon":              raw["weather"][0]["icon"],
+                "wind_kmh":          round(raw["wind"]["speed"] * 3.6, 1),
+                "is_suitable":       _is_weather_suitable(raw),
+                "suitability_score": _weather_suitability_score(raw),
+            }
+            _weather_cache[dest_id] = {"data": data, "ts": time.time()}
+            return data
+    except Exception:
+        return None
+
+
+def _is_weather_suitable(raw: dict) -> bool:
+    condition = raw["weather"][0]["main"].lower()
+    temp = raw["main"]["temp"]
+    if condition in {"thunderstorm", "tornado", "squall"}:
+        return False
+    if temp > 42 or temp < 0:
+        return False
+    return True
+
+
+def _weather_suitability_score(raw: dict) -> float:
+    condition = raw["weather"][0]["main"].lower()
+    temp      = raw["main"]["temp"]
+    humidity  = raw["main"]["humidity"]
+    condition_scores = {
+        "clear": 1.0, "clouds": 0.8, "drizzle": 0.6,
+        "rain": 0.4, "snow": 0.5, "mist": 0.6,
+        "fog": 0.5, "haze": 0.6, "thunderstorm": 0.1, "tornado": 0.0,
+    }
+    base = condition_scores.get(condition, 0.6)
+    if 18 <= temp <= 32:
+        temp_score = 1.0
+    elif 10 <= temp < 18 or 32 < temp <= 38:
+        temp_score = 0.7
+    else:
+        temp_score = 0.3
+    humidity_score = 1.0 if humidity < 70 else 0.7 if humidity < 85 else 0.5
+    return round(base * 0.5 + temp_score * 0.3 + humidity_score * 0.2, 2)
+
 
 
 # ─── Pydantic models ─────────────────────────────────────────────────────────
@@ -309,29 +422,36 @@ def root():
 
 
 @app.post("/recommend")
-def recommend(prefs: UserPreferences):
+async def recommend(prefs: UserPreferences):
     global interaction_count
 
     state     = get_state(prefs.dict())
     state_idx = state_to_index(state)
 
-    # Initialise per-user epsilon
     if prefs.user_id not in user_epsilon:
         user_epsilon[prefs.user_id] = EPSILON_INIT
 
     epsilon = user_epsilon[prefs.user_id]
 
     scored = []
-    for dest in DESTINATIONS:
+    # Hard filter: only include destinations whose budget range overlaps with user budget
+    filtered_destinations = [
+        d for d in DESTINATIONS
+        if not (prefs.budget_max < d["full_budget_min"] or prefs.budget_min > d["full_budget_max"])
+    ]
+    # Fall back to all destinations if filter is too strict
+    if len(filtered_destinations) < 10:
+        filtered_destinations = DESTINATIONS
+    for dest in filtered_destinations:
         base_score = score_destination(dest, prefs.dict())
         q_val      = float(q_table[state_idx][dest["id"]])
         blended    = base_score * 0.5 + (q_val / (abs(q_val) + 1)) * 0.5
 
-        # ε-greedy: occasionally boost a random destination for exploration
         if random.random() < epsilon:
             blended += random.uniform(0, 0.1)
 
-        in_budget = prefs.budget_min <= dest["budget"] <= prefs.budget_max
+        dest_min, dest_max = _budget_range_full(dest)
+        in_budget = not (prefs.budget_max < dest_min or prefs.budget_min > dest_max)
 
         scored.append({
             "id":               dest["id"],
@@ -343,7 +463,7 @@ def recommend(prefs: UserPreferences):
             "tags":             dest["tags"],
             "trip_types":       dest["trip_types"],
             "description":      dest["description"],
-            "estimated_cost":   dest["budget"],
+            "estimated_cost":   _best_cost_estimate(dest, prefs.budget_min, prefs.budget_max),
             "budget_range":     [dest["budget_min"], dest["budget_max"]],
             "ideal_days":       dest["ideal_days"],
             "best_seasons":     dest["best_seasons"],
@@ -362,11 +482,11 @@ def recommend(prefs: UserPreferences):
             "coordinates":      dest["coordinates"],
             "score":            round(blended, 3),
             "match_reason":     _match_reason(dest, prefs.dict(), in_budget),
+            "weather":          None,  # filled below for top results
         })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
 
-    # Decay this user's epsilon
     user_epsilon[prefs.user_id] = max(EPSILON_MIN, epsilon * EPSILON_DECAY)
     interaction_count += 1
 
@@ -380,6 +500,25 @@ def recommend(prefs: UserPreferences):
             seen_states[dest_state] = seen_states.get(dest_state, 0) + 1
         if len(diverse) == 10:
             break
+
+    # Fetch live weather for top 10 results
+    # Sequential with small delay to respect free-tier rate limit (60/min)
+    import asyncio
+    dest_map = {d["id"]: d for d in DESTINATIONS}
+    weather_results = []
+    for item in diverse:
+        w = await fetch_weather(dest_map[item["id"]])
+        weather_results.append(w)
+        await asyncio.sleep(0.1)  # 100ms gap = max 10/sec, well within 60/min
+
+    for item, weather in zip(diverse, weather_results):
+        item["weather"] = weather
+        # Adjust score slightly based on weather suitability
+        if weather:
+            ws = weather.get("suitability_score", 0.8)
+            item["score"] = round(item["score"] * (0.85 + ws * 0.15), 3)
+
+    diverse.sort(key=lambda x: x["score"], reverse=True)
 
     return {
         "recommendations": diverse,
