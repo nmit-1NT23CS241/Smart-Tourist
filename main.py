@@ -464,6 +464,7 @@ async def recommend(prefs: UserPreferences):
             "trip_types":       dest["trip_types"],
             "description":      dest["description"],
             "estimated_cost":   _best_cost_estimate(dest, prefs.budget_min, prefs.budget_max),
+            
             "budget_range":     [dest["budget_min"], dest["budget_max"]],
             "ideal_days":       dest["ideal_days"],
             "best_seasons":     dest["best_seasons"],
