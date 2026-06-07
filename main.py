@@ -711,7 +711,8 @@ def _match_reason(dest: dict, prefs: dict, in_budget: bool) -> str:
 @app.get("/documents/{user_id}", response_class=HTMLResponse)
 async def get_user_documents(user_id: str):
     try:
-        docs = admin_db.collection("travel_documents").where("userId", "==", user_id).get()
+        from google.cloud.firestore_v1.base_query import FieldFilter
+        docs = admin_db.collection("travel_documents").where(filter=FieldFilter("userId", "==", user_id)).get()
 
         doc_items = ""
         if docs:
