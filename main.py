@@ -2,12 +2,14 @@ import json
 import os
 import random
 import time
+import secrets
+import hashlib
 from collections import deque
 from typing import Optional
 
 import httpx
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -253,7 +255,6 @@ def get_state(prefs: dict) -> list:
 
 
 def _matched_tier(dest: dict, budget_min: int, budget_max: int) -> tuple[str, int]:
-    budget_mid = (budget_min + budget_max) / 2
     tb_min, tb_max = dest["tier_budget"]
     tm_min, tm_max = dest["tier_mid"]
     tl_min, tl_max = dest["tier_luxury"]
@@ -491,6 +492,28 @@ class FeedbackRequest(BaseModel):
     sustainability_pref: int
 
 
+class PinVerifyRequest(BaseModel):
+    user_id: str
+    pin:     str
+    token:   str
+
+
+# ─── Security helpers ─────────────────────────────────────────────────────────
+ACCESS_EXPIRY_SECONDS = 60  # 2 minutes
+
+
+def _generate_pin() -> str:
+    return str(random.randint(1000, 9999))
+
+
+def _hash_pin(pin: str) -> str:
+    return hashlib.sha256(pin.encode()).hexdigest()
+
+
+def _generate_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
 # ─── Endpoints ───────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -707,23 +730,206 @@ def _match_reason(dest: dict, prefs: dict, in_budget: bool) -> str:
     return ", ".join(reasons) if reasons else "recommended by RL model"
 
 
-# ─── Digital Travel ID endpoint ───────────────────────────────────────────────
+# ─── Digital Travel ID — Generate PIN + Token ─────────────────────────────────
+@app.post("/documents/generate-access/{user_id}")
+async def generate_access(user_id: str):
+    """
+    Called by Android app when Digital Travel ID screen opens.
+    Returns a 4-digit PIN (shown to owner in app) + token (embedded in QR URL).
+    Both expire in 2 minutes. PIN is single-use.
+    """
+    pin   = _generate_pin()
+    token = _generate_token()
+    expires_at = int(time.time()) + ACCESS_EXPIRY_SECONDS
+
+    admin_db.collection("travel_id_access").document(user_id).set({
+        "pin_hash":   _hash_pin(pin),
+        "token":      token,
+        "expires_at": expires_at,
+        "used":       False,
+    })
+
+    return {
+        "pin":        pin,       # shown to owner in app
+        "token":      token,     # embedded in QR URL
+        "expires_in": ACCESS_EXPIRY_SECONDS,
+    }
+
+
+# ─── Digital Travel ID — PIN entry page (opened by QR scan) ──────────────────
 @app.get("/documents/{user_id}", response_class=HTMLResponse)
-async def get_user_documents(user_id: str):
+async def get_user_documents(user_id: str, token: str = ""):
+    """
+    QR points to: /documents/{user_id}?token=<token>
+    Shows PIN entry page. Documents only served after correct PIN via POST /verify.
+    """
+    if not token:
+        return HTMLResponse(content=_denied_page("No access token provided."), status_code=403)
+
+    # Validate token exists and is not expired/used before even showing PIN page
+    try:
+        doc_ref = admin_db.collection("travel_id_access").document(user_id)
+        access  = doc_ref.get()
+        if not access.exists:
+            return HTMLResponse(content=_denied_page("Invalid QR code."), status_code=403)
+        data = access.to_dict()
+        if data.get("token") != token:
+            return HTMLResponse(content=_denied_page("Invalid QR code."), status_code=403)
+        if data.get("used", False):
+            return HTMLResponse(content=_denied_page("This QR code has already been used."), status_code=403)
+        if int(time.time()) > data.get("expires_at", 0):
+            return HTMLResponse(content=_denied_page("This QR code has expired."), status_code=403)
+    except Exception:
+        return HTMLResponse(content=_denied_page("Unable to verify access."), status_code=403)
+
+    # Token is valid — show PIN entry page
+    return HTMLResponse(content=f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>SafarAI — Enter PIN</title>
+        <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+            body {{ font-family: Arial, sans-serif; background: #f5f5f5; min-height: 100vh;
+                    display: flex; flex-direction: column; align-items: center; padding: 20px; }}
+            .header {{ background: #1A1A2E; color: white; padding: 20px; border-radius: 12px;
+                       text-align: center; margin-bottom: 24px; width: 100%; max-width: 420px; }}
+            .header h1 {{ font-size: 22px; margin-bottom: 4px; }}
+            .header p {{ color: #aaa; font-size: 13px; }}
+            .card {{ background: white; border-radius: 12px; padding: 28px 24px;
+                     box-shadow: 0 2px 8px rgba(0,0,0,0.1); width: 100%;
+                     max-width: 420px; text-align: center; }}
+            .lock {{ font-size: 44px; margin-bottom: 12px; }}
+            h2 {{ color: #1A1A2E; font-size: 18px; margin-bottom: 8px; }}
+            .subtitle {{ color: #666; font-size: 13px; margin-bottom: 24px; line-height: 1.5; }}
+            .pin-row {{ display: flex; gap: 12px; justify-content: center; margin-bottom: 24px; }}
+            .pin-box {{
+                width: 60px; height: 68px; font-size: 30px; font-weight: bold;
+                text-align: center; border: 2px solid #ddd; border-radius: 10px;
+                outline: none; color: #1A1A2E; background: #fafafa;
+            }}
+            .pin-box:focus {{ border-color: #1A1A2E; background: white; }}
+            .btn {{ width: 100%; padding: 14px; background: #1A1A2E; color: white;
+                    border: none; border-radius: 10px; font-size: 16px; font-weight: bold;
+                    cursor: pointer; }}
+            .btn:disabled {{ background: #999; cursor: not-allowed; }}
+            .error {{ color: #e53935; font-size: 13px; margin-top: 14px; display: none; }}
+            .note {{ color: #aaa; font-size: 11px; margin-top: 16px; }}
+        </style>
+    </head>
+    <body>
+        <div class="header"><h1>🌍 SafarAI</h1><p>Digital Travel ID Verification</p></div>
+        <div class="card">
+            <div class="lock">🔐</div>
+            <h2>Enter Access PIN</h2>
+            <p class="subtitle">Ask the document owner for the 4-digit PIN shown in their SafarAI app</p>
+            <div class="pin-row">
+                <input class="pin-box" id="p1" type="number" min="0" max="9" inputmode="numeric">
+                <input class="pin-box" id="p2" type="number" min="0" max="9" inputmode="numeric">
+                <input class="pin-box" id="p3" type="number" min="0" max="9" inputmode="numeric">
+                <input class="pin-box" id="p4" type="number" min="0" max="9" inputmode="numeric">
+            </div>
+            <button class="btn" id="verifyBtn" onclick="verifyPin()">Verify &amp; View Documents</button>
+            <div class="error" id="err">❌ Incorrect PIN or session expired. Ask for a new QR code.</div>
+            <p class="note">⏱️ PIN expires in 1 minute and is valid for one use only</p>
+        </div>
+        <script>
+            const token  = "{token}";
+            const userId = "{user_id}";
+            const inputs = ['p1','p2','p3','p4'].map(id => document.getElementById(id));
+
+            inputs.forEach((inp, i) => {{
+                inp.addEventListener('input', () => {{
+                    inp.value = inp.value.slice(-1).replace(/[^0-9]/g,'');
+                    if (inp.value && i < 3) inputs[i+1].focus();
+                }});
+                inp.addEventListener('keydown', e => {{
+                    if (e.key === 'Backspace' && !inp.value && i > 0) inputs[i-1].focus();
+                }});
+            }});
+            inputs[0].focus();
+
+            async function verifyPin() {{
+                const pin = inputs.map(i => i.value).join('');
+                if (pin.length !== 4) return;
+                document.getElementById('verifyBtn').disabled = true;
+                document.getElementById('verifyBtn').textContent = 'Verifying...';
+                document.getElementById('err').style.display = 'none';
+
+                const resp = await fetch('/documents/verify', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{ user_id: userId, pin: pin, token: token }})
+                }});
+
+                if (resp.ok) {{
+                    const html = await resp.text();
+                    document.open(); document.write(html); document.close();
+                }} else {{
+                    document.getElementById('err').style.display = 'block';
+                    document.getElementById('verifyBtn').disabled = false;
+                    document.getElementById('verifyBtn').textContent = 'Verify & View Documents';
+                    inputs.forEach(i => i.value = '');
+                    inputs[0].focus();
+                }}
+            }}
+        </script>
+    </body>
+    </html>
+    """)
+
+
+# ─── Digital Travel ID — Verify PIN + serve documents ────────────────────────
+@app.post("/documents/verify", response_class=HTMLResponse)
+async def verify_and_show(req: PinVerifyRequest):
+    """
+    Verifies PIN hash + token + expiry + single-use.
+    If all pass → marks used + returns document HTML.
+    """
+    try:
+        doc_ref = admin_db.collection("travel_id_access").document(req.user_id)
+        access  = doc_ref.get()
+
+        if not access.exists:
+            raise HTTPException(status_code=403)
+
+        data = access.to_dict()
+
+        if data.get("token") != req.token:
+            raise HTTPException(status_code=403)
+        if data.get("used", False):
+            raise HTTPException(status_code=403)
+        if int(time.time()) > data.get("expires_at", 0):
+            raise HTTPException(status_code=403)
+        if _hash_pin(req.pin) != data.get("pin_hash"):
+            raise HTTPException(status_code=403)
+
+        # All checks passed — burn immediately
+        doc_ref.update({"used": True})
+
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=403)
+
+    # Fetch documents
     try:
         from google.cloud.firestore_v1.base_query import FieldFilter
-        docs = admin_db.collection("travel_documents").where(filter=FieldFilter("userId", "==", user_id)).get()
+        docs = admin_db.collection("travel_documents").where(
+            filter=FieldFilter("userId", "==", req.user_id)
+        ).get()
 
         doc_items = ""
         if docs:
             categories = {}
             for doc in docs:
-                data = doc.to_dict()
-                cat = data.get("category", "Other")
+                d = doc.to_dict()
+                cat = d.get("category", "Other")
                 if cat not in categories:
                     categories[cat] = []
-                categories[cat].append(data.get("base64Image", ""))
-
+                categories[cat].append(d.get("base64Image", ""))
             for cat, images in categories.items():
                 doc_items += f'<div class="doc-section"><h3>📄 {cat}</h3>'
                 for img in images:
@@ -731,12 +937,11 @@ async def get_user_documents(user_id: str):
                         doc_items += f'<img src="data:image/jpeg;base64,{img}" style="width:100%;border-radius:8px;margin-bottom:8px;"/>'
                 doc_items += '</div>'
         else:
-            doc_items = '<p style="color:#999">No documents uploaded yet</p>'
+            doc_items = '<p style="color:#999">No documents uploaded yet.</p>'
+    except Exception:
+        doc_items = '<p style="color:#999">Unable to load documents.</p>'
 
-    except Exception as e:
-        doc_items = f'<p style="color:#999">Unable to load documents: {str(e)}</p>'
-
-    return f"""
+    return HTMLResponse(content=f"""
     <!DOCTYPE html>
     <html>
     <head>
@@ -745,31 +950,71 @@ async def get_user_documents(user_id: str):
         <title>SafarAI Digital Travel ID</title>
         <style>
             body {{ font-family: Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 20px; }}
-            .header {{ background: #1A1A2E; color: white; padding: 20px; border-radius: 12px; text-align: center; margin-bottom: 20px; }}
+            .header {{ background: #1A1A2E; color: white; padding: 20px; border-radius: 12px;
+                       text-align: center; margin-bottom: 20px; }}
             .header h1 {{ margin: 0; font-size: 24px; }}
             .header p {{ margin: 5px 0 0; color: #aaa; }}
-            .card {{ background: white; border-radius: 12px; padding: 16px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
-            .verified {{ color: #2E7D6E; font-weight: bold; font-size: 18px; text-align: center; margin: 20px 0; }}
+            .verified {{ color: #2E7D6E; font-weight: bold; font-size: 18px;
+                         text-align: center; margin: 20px 0; }}
+            .banner {{ background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px;
+                       padding: 10px 14px; font-size: 12px; color: #856404;
+                       text-align: center; margin-bottom: 16px; }}
+            .card {{ background: white; border-radius: 12px; padding: 16px; margin-bottom: 12px;
+                     box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
             .doc-section {{ margin-bottom: 16px; }}
             .doc-section h3 {{ color: #1A1A2E; margin-bottom: 8px; }}
             .uid {{ color: #999; font-size: 12px; text-align: center; margin-top: 20px; }}
         </style>
     </head>
     <body>
-        <div class="header">
-            <h1>🌍 SafarAI</h1>
-            <p>Digital Travel ID</p>
-        </div>
+        <div class="header"><h1>🌍 SafarAI</h1><p>Digital Travel ID</p></div>
         <div class="verified">✅ Verified Traveller</div>
+        <div class="banner">🔒 This QR + PIN are now invalid. A new one must be generated for next use.</div>
         <div class="card">
             <b>Traveller ID</b><br>
-            <span style="color:#1A1A2E">ST-{user_id[:8].upper()}</span>
+            <span style="color:#1A1A2E">ST-{req.user_id[:8].upper()}</span>
         </div>
         <div class="card">
             <b>Uploaded Documents</b><br><br>
             {doc_items}
         </div>
         <div class="uid">Powered by SafarAI · nmit-1NT23CS241</div>
+    </body>
+    </html>
+    """)
+
+
+def _denied_page(reason: str) -> str:
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>SafarAI — Access Denied</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; background: #f5f5f5; display: flex;
+                    flex-direction: column; align-items: center; justify-content: center;
+                    min-height: 100vh; margin: 0; padding: 20px; text-align: center; }}
+            .header {{ background: #1A1A2E; color: white; padding: 20px; border-radius: 12px;
+                       margin-bottom: 24px; width: 100%; max-width: 420px; }}
+            .card {{ background: white; border-radius: 12px; padding: 32px 24px;
+                     box-shadow: 0 2px 8px rgba(0,0,0,0.1); width: 100%; max-width: 420px; }}
+            .icon {{ font-size: 48px; margin-bottom: 16px; }}
+            h2 {{ color: #e53935; margin-bottom: 8px; }}
+            p {{ color: #666; font-size: 14px; line-height: 1.5; }}
+        </style>
+    </head>
+    <body>
+        <div class="header"><h1>🌍 SafarAI</h1><p>Digital Travel ID</p></div>
+        <div class="card">
+            <div class="icon">🔒</div>
+            <h2>Access Denied</h2>
+            <p>{reason}</p>
+            <p style="margin-top:12px;font-size:12px;color:#999">
+                Ask the document owner to generate a fresh QR from their SafarAI app.
+            </p>
+        </div>
     </body>
     </html>
     """
