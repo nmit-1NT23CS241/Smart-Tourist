@@ -9,7 +9,17 @@ import httpx
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+import firebase_admin
+from firebase_admin import credentials, firestore as admin_firestore
+
+# ─── Firebase Admin SDK ───────────────────────────────────────────────────────
+if not firebase_admin._apps:
+    cred = credentials.Certificate("/etc/secrets/firebase-key.json")
+    firebase_admin.initialize_app(cred)
+
+admin_db = admin_firestore.client()
 
 # ─── Weather config ───────────────────────────────────────────────────────────
 try:
@@ -17,8 +27,8 @@ try:
 except ImportError:
     WEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
 WEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
-WEATHER_CACHE_TTL = 3600  # cache weather for 1 hour per destination
-_weather_cache: dict = {}  # {dest_id: {"data": {...}, "ts": timestamp}}
+WEATHER_CACHE_TTL = 3600
+_weather_cache: dict = {}
 
 app = FastAPI(title="SafarAI RL API")
 
@@ -30,9 +40,6 @@ app.add_middleware(
 )
 
 # ─── Dataset loading ──────────────────────────────────────────────────────────
-
-# Map the rich trip_types from the JSON to your app's 5 travel categories.
-# A destination can match multiple categories; the first match is its primary tag.
 TRIP_TYPE_MAP = {
     "nature":    {"Nature", "Wildlife", "Trekking", "Trekking_base", "Mountain",
                   "Valley_scenery", "Rainforest", "Wetland", "Waterfalls",
@@ -58,7 +65,6 @@ TRIP_TYPE_MAP = {
 
 
 def _primary_tags(trip_types: list[str]) -> list[str]:
-    """Return ordered list of matched app categories for a destination."""
     tags = []
     for category, type_set in TRIP_TYPE_MAP.items():
         if any(t in type_set for t in trip_types):
@@ -67,7 +73,6 @@ def _primary_tags(trip_types: list[str]) -> list[str]:
 
 
 def _budget_midpoint(dest: dict) -> int:
-    """Use mid_range total_daily_range midpoint × ideal_days as trip cost proxy."""
     mid = dest["mid_range_category"]["total_daily_range"]
     daily = (mid[0] + mid[1]) / 2
     ideal_days = max(dest.get("ideal_days", 3), 1)
@@ -75,20 +80,15 @@ def _budget_midpoint(dest: dict) -> int:
 
 
 def _budget_range_full(dest: dict) -> tuple[int, int]:
-    """Return full budget range stored in destination dict."""
     return dest["full_budget_min"], dest["full_budget_max"]
 
 
 def _crowd_score(dest: dict) -> float:
-    """Normalise popularity_score (4–10) to a 0–1 crowd level."""
     return (dest["popularity_score"] - 4) / 6.0
 
 
 def _sustainability_score(dest: dict) -> float:
-    """Derive sustainability from safety_rating (6–9) as a proxy (0–1)."""
-    # The JSON has sustainability_notes text but no numeric score.
-    # We use safety_rating + inverse of popularity (popular = more footprint).
-    safety = (dest["safety_rating"] - 6) / 3.0          # 0–1
+    safety = (dest["safety_rating"] - 6) / 3.0
     low_crowd_bonus = 1.0 - _crowd_score(dest) * 0.4
     return round(min(safety * 0.6 + low_crowd_bonus * 0.4, 1.0), 2)
 
@@ -104,7 +104,6 @@ def load_destinations(path: str) -> list[dict]:
         mid = d["mid_range_category"]["total_daily_range"]
         lux = d["luxury_category"]["total_daily_range"]
 
-        # Build a human-readable description from the rich JSON fields
         primary_attractions = ", ".join(d.get("primary_attractions", [])[:3])
         unique = d.get("unique_experiences", "")
         description = f"{unique} Key attractions: {primary_attractions}." if unique else primary_attractions
@@ -126,7 +125,6 @@ def load_destinations(path: str) -> list[dict]:
             "budget":          budget,
             "budget_min":      mid[0],
             "budget_max":      lux[1],
-            # All 3 tiers stored as (min, max) trip cost
             "tier_budget":     (int(bud_tier[0]*ideal_days), int(bud_tier[1]*ideal_days)),
             "tier_mid":        (int(mid_tier[0]*ideal_days), int(mid_tier[1]*ideal_days)),
             "tier_luxury":     (int(lux_tier[0]*ideal_days), int(lux_tier[1]*ideal_days)),
@@ -154,8 +152,6 @@ def load_destinations(path: str) -> list[dict]:
     return destinations
 
 
-# Load from the dataset file — place india_tourism_dataset.json in the same
-# directory as main.py, or set TOURISM_DATASET env var to point elsewhere.
 DATASET_PATH = os.environ.get(
     "TOURISM_DATASET",
     os.path.join(os.path.dirname(__file__), "india_tourism_dataset.json"),
@@ -164,7 +160,6 @@ DESTINATIONS = load_destinations(DATASET_PATH)
 ACTION_SIZE = len(DESTINATIONS)
 
 # ─── RL / DQN agent ──────────────────────────────────────────────────────────
-
 GAMMA = 0.95
 LEARNING_RATE = 0.1
 EPSILON_INIT = 0.3
@@ -184,33 +179,23 @@ CSV_CATEGORY_MAP = {
 
 
 def prewarm_qtable(q: np.ndarray, csv_path: str) -> np.ndarray:
-    """
-    Use real visitor data from the CSV to pre-initialize Q-values.
-    Matches CSV rows to destinations by state + travel_type, then sets
-    Q-values proportional to the average final_recommendation_score.
-    """
     try:
         import pandas as pd
         df = pd.read_csv(csv_path)
         df["travel_type"] = df["category"].map(CSV_CATEGORY_MAP)
         df = df.dropna(subset=["travel_type", "final_recommendation_score"])
-
-        # Average score per state + travel_type (0–1 range)
         avg_scores = (
             df.groupby(["state", "travel_type"])["final_recommendation_score"]
             .mean()
             .to_dict()
         )
-
         warmed = 0
         for dest in DESTINATIONS:
             dest_state = dest["state"]
             for tag in dest["tags"]:
                 key = (dest_state, tag)
                 if key in avg_scores:
-                    # Convert 0-1 score to a small positive Q-value seed
-                    q_seed = float(avg_scores[key]) * 2.0  # scale: 0–2
-                    # Apply to all state slots for this action
+                    q_seed = float(avg_scores[key]) * 2.0
                     q[:, dest["id"]] = np.where(
                         q[:, dest["id"]] == 0,
                         q_seed,
@@ -218,14 +203,12 @@ def prewarm_qtable(q: np.ndarray, csv_path: str) -> np.ndarray:
                     )
                     warmed += 1
                     break
-
         print(f"Q-table pre-warmed from CSV: {warmed} destinations seeded")
     except Exception as e:
         print(f"CSV pre-warming skipped: {e}")
     return q
 
 
-# Load persisted Q-table if it exists, otherwise pre-warm from CSV
 CSV_PATH = os.environ.get(
     "TOURISM_CSV",
     os.path.join(os.path.dirname(__file__), "indian_tourist_places_dataset.csv"),
@@ -233,7 +216,6 @@ CSV_PATH = os.environ.get(
 
 if os.path.exists(Q_TABLE_PATH):
     q_table = np.load(Q_TABLE_PATH)
-    # Resize if destination count changed since last save
     if q_table.shape[1] != ACTION_SIZE:
         new_q = np.zeros((Q_TABLE_SIZE, ACTION_SIZE))
         cols = min(q_table.shape[1], ACTION_SIZE)
@@ -241,7 +223,6 @@ if os.path.exists(Q_TABLE_PATH):
         q_table = new_q
 else:
     q_table = np.zeros((Q_TABLE_SIZE, ACTION_SIZE))
-    # Pre-warm from CSV on first run
     if os.path.exists(CSV_PATH):
         q_table = prewarm_qtable(q_table, CSV_PATH)
         np.save(Q_TABLE_PATH, q_table)
@@ -249,13 +230,11 @@ else:
 
 replay_buffer: deque = deque(maxlen=500)
 interaction_count: int = 0
-
-# Per-user epsilon tracking so different users don't affect each other
 user_epsilon: dict[str, float] = {}
 
 
 def state_to_index(state: list) -> int:
-    discretized = [int(s * 20) for s in state]   # finer buckets than before
+    discretized = [int(s * 20) for s in state]
     return abs(hash(tuple(discretized))) % Q_TABLE_SIZE
 
 
@@ -274,16 +253,11 @@ def get_state(prefs: dict) -> list:
 
 
 def _matched_tier(dest: dict, budget_min: int, budget_max: int) -> tuple[str, int]:
-    """
-    Return (tier_name, cost) for the tier that best fits the user budget.
-    Tiers: budget / mid / luxury
-    """
     budget_mid = (budget_min + budget_max) / 2
     tb_min, tb_max = dest["tier_budget"]
     tm_min, tm_max = dest["tier_mid"]
     tl_min, tl_max = dest["tier_luxury"]
 
-    # Check which tier the user budget overlaps with most
     def overlap(tmin, tmax):
         return max(0, min(budget_max, tmax) - max(budget_min, tmin))
 
@@ -297,7 +271,6 @@ def _matched_tier(dest: dict, budget_min: int, budget_max: int) -> tuple[str, in
         return "mid", int((tm_min + tm_max) / 2)
     else:
         return "budget", int((tb_min + tb_max) / 2)
-
 
 
 MONTH_NAMES = ['January','February','March','April','May','June',
@@ -316,7 +289,6 @@ def _month_to_season(month: int) -> str:
 
 
 def _season_suitability(month: int, best_seasons: list, avoid_seasons: list) -> str:
-    """Returns 'best', 'avoid', or 'okay' for the given month."""
     if month == 0:
         return 'okay'
     season = _month_to_season(month)
@@ -337,7 +309,6 @@ def _season_suitability(month: int, best_seasons: list, avoid_seasons: list) -> 
 
 
 def _seasonal_temp(dest_raw_temp: dict, month: int) -> str:
-    """Get temperature string for given month from dataset temperature ranges."""
     if month == 0 or not dest_raw_temp:
         return None
     season = _month_to_season(month)
@@ -352,15 +323,12 @@ def _seasonal_temp(dest_raw_temp: dict, month: int) -> str:
 
 
 async def fetch_monthly_temp(lat: float, lon: float, month: int) -> Optional[float]:
-    """Fetch historical monthly average temperature from Open-Meteo archive API."""
     if month == 0:
         return None
     try:
-        # Use previous year's data for the selected month
         from datetime import datetime
         year = datetime.now().year - 1
         month_str = f"{month:02d}"
-        # Last day of month
         import calendar
         last_day = calendar.monthrange(year, month)[1]
         start = f"{year}-{month_str}-01"
@@ -381,8 +349,8 @@ async def fetch_monthly_temp(lat: float, lon: float, month: int) -> Optional[flo
         pass
     return None
 
+
 def _best_cost_estimate(dest: dict, budget_min: int, budget_max: int) -> int:
-    """Return the cost of the best matching tier."""
     _, cost = _matched_tier(dest, budget_min, budget_max)
     return cost
 
@@ -391,7 +359,6 @@ def score_destination(dest: dict, prefs: dict) -> float:
     budget_min = prefs["budget_min"]
     budget_max = prefs["budget_max"]
 
-    # Find the best matching tier and score based on that tier overlap
     tier_name, tier_cost = _matched_tier(dest, budget_min, budget_max)
 
     if tier_name == "budget":
@@ -504,21 +471,19 @@ def _weather_suitability_score(raw: dict) -> float:
     return round(base * 0.5 + temp_score * 0.3 + humidity_score * 0.2, 2)
 
 
-
 # ─── Pydantic models ─────────────────────────────────────────────────────────
-
 class UserPreferences(BaseModel):
     budget_min:         int
     budget_max:         int
-    travel_type:        str   # nature | heritage | beach | culture | adventure
-    sustainability_pref: int  # 0–10
+    travel_type:        str
+    sustainability_pref: int
     user_id:            str
-    travel_month:       int = 0  # 1-12, 0 = not specified
+    travel_month:       int = 0
 
 
 class FeedbackRequest(BaseModel):
     user_id:            str
-    destination_id:     int   # 0-indexed ID used in Q-table
+    destination_id:     int
     liked:              bool
     budget_min:         int
     budget_max:         int
@@ -527,7 +492,6 @@ class FeedbackRequest(BaseModel):
 
 
 # ─── Endpoints ───────────────────────────────────────────────────────────────
-
 @app.get("/")
 def root():
     return {
@@ -550,12 +514,10 @@ async def recommend(prefs: UserPreferences):
     epsilon = user_epsilon[prefs.user_id]
 
     scored = []
-    # Hard filter: only include destinations whose budget range overlaps with user budget
     filtered_destinations = [
         d for d in DESTINATIONS
         if not (prefs.budget_max < d["full_budget_min"] or prefs.budget_min > d["full_budget_max"])
     ]
-    # Fall back to all destinations if filter is too strict
     if len(filtered_destinations) < 10:
         filtered_destinations = DESTINATIONS
     for dest in filtered_destinations:
@@ -599,9 +561,9 @@ async def recommend(prefs: UserPreferences):
             "coordinates":      dest["coordinates"],
             "score":            round(blended, 3),
             "match_reason":     _match_reason(dest, prefs.dict(), in_budget),
-            "weather":          None,  # filled below for top results
-            "season_suitability": None,  # filled below
-            "seasonal_temp":     None,  # filled below
+            "weather":          None,
+            "season_suitability": None,
+            "seasonal_temp":     None,
             "travel_month":      prefs.travel_month,
             "travel_month_name": MONTH_NAMES[prefs.travel_month - 1] if prefs.travel_month > 0 else None,
         })
@@ -611,7 +573,6 @@ async def recommend(prefs: UserPreferences):
     user_epsilon[prefs.user_id] = max(EPSILON_MIN, epsilon * EPSILON_DECAY)
     interaction_count += 1
 
-    # Diversity filter — max 1 per state
     seen_states: dict[str, int] = {}
     diverse = []
     for item in scored:
@@ -622,40 +583,33 @@ async def recommend(prefs: UserPreferences):
         if len(diverse) == 10:
             break
 
-    # Fetch live weather for top 10 results
-    # Sequential with small delay to respect free-tier rate limit (60/min)
     import asyncio
     dest_map = {d["id"]: d for d in DESTINATIONS}
     weather_results = []
     for item in diverse:
         w = await fetch_weather(dest_map[item["id"]])
         weather_results.append(w)
-        await asyncio.sleep(0.1)  # 100ms gap = max 10/sec, well within 60/min
+        await asyncio.sleep(0.1)
 
     for item, weather in zip(diverse, weather_results):
         item["weather"] = weather
         dest = dest_map[item["id"]]
 
-        # Season suitability
         suitability = _season_suitability(
             prefs.travel_month,
             dest.get("best_seasons", []),
             dest.get("avoid_seasons", [])
         )
         item["season_suitability"] = suitability
-
-        # Seasonal temperature from dataset
         item["seasonal_temp"] = _seasonal_temp(
             dest.get("avg_temp_by_season", {}),
             prefs.travel_month
         )
 
-        # Adjust score based on weather suitability
         if weather:
             ws = weather.get("suitability_score", 0.8)
             item["score"] = round(item["score"] * (0.85 + ws * 0.15), 3)
 
-        # Adjust score based on season suitability
         if suitability == "avoid":
             item["score"] = round(item["score"] * 0.7, 3)
         elif suitability == "best":
@@ -685,20 +639,15 @@ def feedback(fb: FeedbackRequest):
 
     state       = get_state(prefs)
     state_idx   = state_to_index(state)
-
-    # Slightly perturb next_state_idx to represent state transition
-    # (in a stateless tourism app there's no true next-state; we offset the hash)
     next_state_idx = (state_idx + fb.destination_id) % Q_TABLE_SIZE
 
     reward = 1.0 if fb.liked else -0.5
     replay_buffer.append((state_idx, fb.destination_id, reward, next_state_idx))
 
-    # Mini-batch update
     batch = random.sample(replay_buffer, min(16, len(replay_buffer)))
     for s, a, r, ns in batch:
         update_q_table(s, a, r, ns)
 
-    # Persist Q-table to disk after every feedback
     save_q_table()
 
     return {
@@ -714,7 +663,6 @@ def get_destinations(
     state:       str | None = None,
     max_budget:  int | None = None,
 ):
-    """Return all destinations with optional filters."""
     results = DESTINATIONS
     if travel_type:
         results = [d for d in results if travel_type in d["tags"]]
@@ -727,7 +675,6 @@ def get_destinations(
 
 @app.get("/stats")
 def stats():
-    """RL model stats — useful for demo/presentation."""
     nonzero = int(np.count_nonzero(q_table))
     total   = Q_TABLE_SIZE * ACTION_SIZE
     top_actions = np.argsort(np.max(q_table, axis=0))[-5:][::-1]
@@ -745,8 +692,6 @@ def stats():
     }
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-
 def _match_reason(dest: dict, prefs: dict, in_budget: bool) -> str:
     reasons = []
     if in_budget:
@@ -760,10 +705,36 @@ def _match_reason(dest: dict, prefs: dict, in_budget: bool) -> str:
     if dest["safety_rating"] >= 8:
         reasons.append("highly safe")
     return ", ".join(reasons) if reasons else "recommended by RL model"
-from fastapi.responses import HTMLResponse
 
+
+# ─── Digital Travel ID endpoint ───────────────────────────────────────────────
 @app.get("/documents/{user_id}", response_class=HTMLResponse)
 async def get_user_documents(user_id: str):
+    try:
+        docs = admin_db.collection("travel_documents").where("userId", "==", user_id).get()
+
+        doc_items = ""
+        if docs:
+            categories = {}
+            for doc in docs:
+                data = doc.to_dict()
+                cat = data.get("category", "Other")
+                if cat not in categories:
+                    categories[cat] = []
+                categories[cat].append(data.get("base64Image", ""))
+
+            for cat, images in categories.items():
+                doc_items += f'<div class="doc-section"><h3>📄 {cat}</h3>'
+                for img in images:
+                    if img:
+                        doc_items += f'<img src="data:image/jpeg;base64,{img}" style="width:100%;border-radius:8px;margin-bottom:8px;"/>'
+                doc_items += '</div>'
+        else:
+            doc_items = '<p style="color:#999">No documents uploaded yet</p>'
+
+    except Exception as e:
+        doc_items = f'<p style="color:#999">Unable to load documents: {str(e)}</p>'
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -778,7 +749,9 @@ async def get_user_documents(user_id: str):
             .header p {{ margin: 5px 0 0; color: #aaa; }}
             .card {{ background: white; border-radius: 12px; padding: 16px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
             .verified {{ color: #2E7D6E; font-weight: bold; font-size: 18px; text-align: center; margin: 20px 0; }}
-            .uid {{ color: #999; font-size: 12px; text-align: center; }}
+            .doc-section {{ margin-bottom: 16px; }}
+            .doc-section h3 {{ color: #1A1A2E; margin-bottom: 8px; }}
+            .uid {{ color: #999; font-size: 12px; text-align: center; margin-top: 20px; }}
         </style>
     </head>
     <body>
@@ -792,8 +765,8 @@ async def get_user_documents(user_id: str):
             <span style="color:#1A1A2E">ST-{user_id[:8].upper()}</span>
         </div>
         <div class="card">
-            <b>Document Vault</b><br>
-            <p style="color:#666">This traveller has securely stored their travel documents in SafarAI.</p>
+            <b>Uploaded Documents</b><br><br>
+            {doc_items}
         </div>
         <div class="uid">Powered by SafarAI · nmit-1NT23CS241</div>
     </body>
